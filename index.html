@@ -2727,54 +2727,30 @@ function fileIcon(ext) {
 //   objectURL revoke đúng chỗ, không leak
 //   Exponential backoff + icon fallback có thể click retry
 // ═══════════════════════════════════════════════════════════
+// MODULE: MEDIACACHE v3 — Self-Healing Telegram Media System
+// ═══════════════════════════════════════════════════════════
+// ROOT CAUSE FIX:
+//   v1/v2 dùng fetch(cdnUrl) → CORS block trên mobile → blob rỗng → đen
+//   v3: KHÔNG fetch blob. Dùng img.src = cdnUrl trực tiếp.
+//   Telegram CDN hoạt động tốt với <img src> (no-cors img load).
+//   Chỉ gọi getFile() để lấy URL mới khi URL cũ expire/lỗi.
+//
+//   Flow: img[data-fileid] → IO observe → getFile() → img.src=cdnUrl
+//         img.onload → canvas integrity check (detect black)
+//         black/error → xoá URL cache → retry với fresh URL
+// ═══════════════════════════════════════════════════════════
 const MediaCache = (() => {
-  const DB_NAME   = 'TeleDriveMedia';
-  const DB_VER    = 2;
-  const ST_BLOB   = 'blobs';
-  const MAX_BLOB  = 8 * 1024 * 1024; // 8MB max cache
-  const TICK_MS   = 120;             // worker interval
-  const MAX_RETRY = 3;
-  const URL_TTL   = 55 * 60 * 1000; // 55 min
+  const URL_TTL   = 50 * 60 * 1000; // 50 min (TG CDN expire ~1h)
+  const MAX_RETRY = 4;
+  const TICK_MS   = 80;
 
-  let _db      = null;
-  let _dbReady = false;
-  const _Q     = [];        // queue items { img, fileId, attempt }
-  const _fly   = new Set(); // dedup: fileId đang fetch
-  const _urls  = new Map(); // memory URL cache: fileId → {url, ts}
+  // Memory URL cache: fileId → { url, ts }
+  const _urls  = new Map();
+  // Queue + dedup
+  const _Q     = [];
+  const _fly   = new Set();
 
-  // ── IndexedDB ───────────────────────────────────────────
-  function _openDB() {
-    return new Promise((res, rej) => {
-      const r = indexedDB.open(DB_NAME, DB_VER);
-      r.onupgradeneeded = e => {
-        const db = e.target.result;
-        if (!db.objectStoreNames.contains(ST_BLOB))
-          db.createObjectStore(ST_BLOB, { keyPath: 'fileId' });
-      };
-      r.onsuccess = e => { _db = e.target.result; _dbReady = true; res(); };
-      r.onerror   = ()  => rej();
-    });
-  }
-
-  function _idbGet(k) {
-    return new Promise(ok => {
-      try {
-        const r = _db.transaction(ST_BLOB,'readonly').objectStore(ST_BLOB).get(k);
-        r.onsuccess = () => ok(r.result || null);
-        r.onerror   = () => ok(null);
-      } catch { ok(null); }
-    });
-  }
-
-  function _idbPut(v) {
-    try { _db.transaction(ST_BLOB,'readwrite').objectStore(ST_BLOB).put(v); } catch {}
-  }
-
-  function _idbDel(k) {
-    try { _db.transaction(ST_BLOB,'readwrite').objectStore(ST_BLOB).delete(k); } catch {}
-  }
-
-  // ── Memory URL cache ────────────────────────────────────
+  // ── URL cache helpers ────────────────────────────────────
   function _getUrl(id) {
     const e = _urls.get(id);
     if (!e) return null;
@@ -2782,89 +2758,86 @@ const MediaCache = (() => {
     return e.url;
   }
   function _setUrl(id, url) { _urls.set(id, { url, ts: Date.now() }); }
+  function _delUrl(id) { _urls.delete(id); }
 
-  // ── Integrity: detect black image via canvas ────────────
+  // ── Integrity: detect black image ───────────────────────
   function _isBlack(img) {
     try {
       const c = document.createElement('canvas');
-      c.width = c.height = 16;
-      const ctx = c.getContext('2d');
-      ctx.drawImage(img, 0, 0, 16, 16);
-      const px = ctx.getImageData(0, 0, 16, 16).data;
+      c.width = c.height = 8;
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0, 8, 8);
+      const px = ctx.getImageData(0, 0, 8, 8).data;
       let s = 0;
       for (let i = 0; i < px.length; i += 4) s += px[i] + px[i+1] + px[i+2];
-      return (s / (px.length / 4 * 3)) < 10;
+      return (s / (px.length / 4 * 3)) < 12;
     } catch { return false; }
   }
 
-  // ── Apply objectURL to img, verify after load ───────────
-  function _apply(img, objUrl, fileId, attempt, fromCache) {
-    if (!img.isConnected) { URL.revokeObjectURL(objUrl); return; }
-    img.onload = () => {
-      img.onload = img.onerror = null;
-      if (_isBlack(img)) {
-        // Ảnh đen → xoá cache, retry
-        URL.revokeObjectURL(objUrl);
-        if (fromCache) _idbDel(fileId);
-        _urls.delete(fileId);
-        _retry(img, fileId, attempt);
-        return;
-      }
-      // OK — objectURL được giữ cho đến khi img bị remove
-    };
-    img.onerror = () => {
-      img.onload = img.onerror = null;
-      URL.revokeObjectURL(objUrl);
-      if (fromCache) _idbDel(fileId);
-      _urls.delete(fileId);
-      _retry(img, fileId, attempt);
-    };
-    img.src = objUrl;
-  }
-
-  // ── Core load ────────────────────────────────────────────
+  // ── Core: load one image ─────────────────────────────────
   async function _load(img, fileId, attempt) {
     if (!img.isConnected) return;
 
-    // Guard: token chưa có → chờ
-    if (!cfg || !cfg.token) {
-      setTimeout(() => { if (img.isConnected) _push(img, fileId, attempt); }, 800);
+    // Wait for cfg.token to be ready (max 5s)
+    let waited = 0;
+    while ((!window.cfg || !window.cfg.token) && waited < 5000) {
+      await new Promise(r => setTimeout(r, 200));
+      waited += 200;
+    }
+    if (!window.cfg || !window.cfg.token) {
+      console.warn('[MC] no token after 5s, skip', fileId);
       return;
     }
 
-    // 1. IndexedDB cache
-    if (_dbReady) {
-      const cached = await _idbGet(fileId);
-      if (cached && cached.blob && cached.blob.size > 100) {
-        const ou = URL.createObjectURL(cached.blob);
-        _apply(img, ou, fileId, attempt, true);
+    // Get CDN URL: memory cache first, then getFile API
+    let cdnUrl = _getUrl(fileId);
+    if (!cdnUrl) {
+      try {
+        const fi = await tgGet('getFile', { file_id: fileId });
+        if (!fi.ok || !fi.result?.file_path)
+          throw new Error('getFile failed: ' + (fi.description||''));
+        cdnUrl = `${TG_API}/file/bot${cfg.token}/${fi.result.file_path}`;
+        _setUrl(fileId, cdnUrl);
+      } catch (e) {
+        console.warn('[MC] getFile error', fileId, e.message);
+        _retry(img, fileId, attempt);
         return;
       }
     }
 
-    // 2. Fetch fresh từ Telegram
-    try {
-      let cdnUrl = _getUrl(fileId);
-      if (!cdnUrl) {
-        const fi = await tgGet('getFile', { file_id: fileId });
-        if (!fi.ok || !fi.result?.file_path) throw new Error('getFile failed');
-        cdnUrl = `${TG_API}/file/bot${cfg.token}/${fi.result.file_path}`;
-        _setUrl(fileId, cdnUrl);
-      }
-      const resp = await fetch(cdnUrl, { mode: 'cors' });
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      const blob = await resp.blob();
-      if (!blob || blob.size < 100) throw new Error('blob empty');
-      if (_dbReady && blob.size <= MAX_BLOB) _idbPut({ fileId, blob, ts: Date.now() });
-      const ou = URL.createObjectURL(blob);
-      _apply(img, ou, fileId, attempt, false);
-    } catch (e) {
-      console.warn('[MC]', fileId, 'attempt', attempt, e.message);
-      _retry(img, fileId, attempt);
-    }
+    // Set img.src directly — no fetch(), avoids CORS
+    _applyUrl(img, cdnUrl, fileId, attempt);
   }
 
-  // ── Retry + fallback icon ────────────────────────────────
+  // ── Apply CDN URL to img ─────────────────────────────────
+  function _applyUrl(img, cdnUrl, fileId, attempt) {
+    if (!img.isConnected) return;
+
+    img.onload = () => {
+      img.onload = img.onerror = null;
+      if (_isBlack(img)) {
+        console.warn('[MC] black image', fileId, 'attempt', attempt);
+        _delUrl(fileId);
+        img.src = '';
+        _retry(img, fileId, attempt);
+        return;
+      }
+      // OK!
+      img.style.background = 'none';
+    };
+
+    img.onerror = () => {
+      img.onload = img.onerror = null;
+      img.src = '';
+      _delUrl(fileId); // buộc re-fetch URL mới lần sau
+      console.warn('[MC] img.onerror', fileId, 'attempt', attempt);
+      _retry(img, fileId, attempt);
+    };
+
+    img.src = cdnUrl;
+  }
+
+  // ── Retry with exponential backoff ──────────────────────
   function _retry(img, fileId, attempt) {
     if (attempt >= MAX_RETRY) {
       if (!img.isConnected) return;
@@ -2874,17 +2847,22 @@ const MediaCache = (() => {
       ph.textContent = '🖼';
       ph.title = 'Ảnh lỗi — bấm để thử lại';
       ph.style.cursor = 'pointer';
-      ph.onclick = () => { ph.remove(); img.style.display=''; _push(img,fileId,1); };
+      ph.onclick = () => {
+        ph.remove();
+        img.style.display = '';
+        _push(img, fileId, 1);
+      };
       img.parentNode && img.parentNode.insertBefore(ph, img);
       return;
     }
-    const delay = Math.min(1500 * Math.pow(2, attempt - 1), 12000);
+    const delay = Math.min(1200 * Math.pow(2, attempt - 1), 15000);
     setTimeout(() => { if (img.isConnected) _push(img, fileId, attempt + 1); }, delay);
   }
 
   // ── Queue ────────────────────────────────────────────────
   function _push(img, fileId, attempt) {
     if (_fly.has(fileId)) return;
+    // Remove duplicate
     const i = _Q.findIndex(x => x.fileId === fileId);
     if (i >= 0) _Q.splice(i, 1);
     _Q.push({ img, fileId, attempt: attempt || 1 });
@@ -2904,58 +2882,47 @@ const MediaCache = (() => {
 
   // ── IntersectionObserver ─────────────────────────────────
   let _io = null;
+
   function _setupIO() {
     _io = new IntersectionObserver(entries => {
       entries.forEach(e => {
         if (!e.isIntersecting) return;
         const img = e.target;
         const fid = img.dataset.fileid;
-        if (!fid) return;
+        if (!fid || img._mcDone) return;
         _io.unobserve(img);
         _push(img, fid, 1);
       });
-    }, { rootMargin: '400px' }); // preload 400px trước viewport
+    }, { rootMargin: '200px' });
   }
 
-  // ── Public: observe img[data-fileid] không có src ───────
+  // ── Public: observe img[data-fileid] ────────────────────
   function observeAll() {
     if (!_io) return;
     document.querySelectorAll('img[data-fileid]').forEach(img => {
-      const s = img.src;
-      const empty = !s || s === '' || s === location.href || s.endsWith('/');
-      if (empty) _io.observe(img);
+      if (!img.src || img.src === '' || img.src === location.href) {
+        _io.observe(img);
+      }
     });
   }
 
   // ── Public: onerror fallback ─────────────────────────────
   function rehydrateImg(img) {
     const fid = img.dataset.fileid;
-    if (!fid) { img.style.display='none'; return; }
+    if (!fid) { img.style.display = 'none'; return; }
     img.onerror = null;
     img.src = '';
-    _urls.delete(fid);
+    _delUrl(fid);
     _push(img, fid, 1);
   }
 
-  // ── Public: prune old blobs ──────────────────────────────
-  async function pruneCache(days) {
-    if (!_dbReady) return;
-    const cut = Date.now() - (days||14)*86400000;
-    const req = _db.transaction(ST_BLOB,'readwrite').objectStore(ST_BLOB).openCursor();
-    req.onsuccess = e => {
-      const cur = e.target.result;
-      if (!cur) return;
-      if ((cur.value.ts||0) < cut) cur.delete();
-      cur.continue();
-    };
-  }
+  // ── Public: clear all URL cache (force re-fetch) ─────────
+  function clearUrlCache() { _urls.clear(); }
 
   // ── Init ─────────────────────────────────────────────────
-  async function _init() {
-    try { await _openDB(); } catch(e) { console.warn('[MC] IndexedDB unavailable', e); }
+  function _init() {
     _setupIO();
     _startWorker();
-    setTimeout(() => pruneCache(14), 10000);
   }
 
   if (document.readyState === 'loading')
@@ -2963,8 +2930,12 @@ const MediaCache = (() => {
   else
     _init();
 
-  return { rehydrateImg, observeAll, pruneCache };
+  return { rehydrateImg, observeAll, clearUrlCache,
+           // pruneCache stub (IndexedDB removed — no longer needed)
+           pruneCache: () => {} };
 })();
+
+
 
 
 function thumbGradient(ext) {
