@@ -1712,21 +1712,18 @@ async function fetchFromTelegram() {
 
       const caption   = msg.caption || '';
       const chunkInfo = parseChunkCaption(caption);
-      try {
-        const fi = await tgGet('getFile', { file_id: fileId });
-        const filePath = fi.result?.file_path || '';
-        const cdnUrl   = filePath ? `${TG_API}/file/bot${cfg.token}/${filePath}` : '';
-        if (chunkInfo) {
-          if (!chunkMap[chunkInfo.groupId]) {
-            chunkMap[chunkInfo.groupId] = { groupId: chunkInfo.groupId, totalChunks: chunkInfo.total, name: fileName.replace(/\.part\d+of\d+$/, ''), date: new Date(msg.date * 1000).toISOString(), chunks: [], size: 0 };
-          }
-          chunkMap[chunkInfo.groupId].chunks[chunkInfo.part] = { fileId, filePath, msgId: msg.message_id };
-          const szM = caption.match(/📦 ([\d.]+)(GB|MB|KB|B)/);
-          if (szM) { const u = {B:1,KB:1024,MB:1048576,GB:1073741824}; chunkMap[chunkInfo.groupId].size = Math.round(parseFloat(szM[1]) * (u[szM[2]]||1)); }
-        } else {
-          rawFiles.push({ id: fileId, name: fileName, size: fileSize, fileId, filePath, url: cdnUrl, mimeType, date: new Date(msg.date * 1000).toISOString(), msgId: msg.message_id });
+      // Không gọi getFile khi sync — tốn API không cần thiết
+      // URL sẽ được lấy fresh khi render ảnh (loadImgUrls)
+      if (chunkInfo) {
+        if (!chunkMap[chunkInfo.groupId]) {
+          chunkMap[chunkInfo.groupId] = { groupId: chunkInfo.groupId, totalChunks: chunkInfo.total, name: fileName.replace(/\.part\d+of\d+$/, ''), date: new Date(msg.date * 1000).toISOString(), chunks: [], size: 0 };
         }
-      } catch {}
+        chunkMap[chunkInfo.groupId].chunks[chunkInfo.part] = { fileId, filePath: '', msgId: msg.message_id };
+        const szM = caption.match(/📦 ([\d.]+)(GB|MB|KB|B)/);
+        if (szM) { const u = {B:1,KB:1024,MB:1048576,GB:1073741824}; chunkMap[chunkInfo.groupId].size = Math.round(parseFloat(szM[1]) * (u[szM[2]]||1)); }
+      } else {
+        rawFiles.push({ id: fileId, name: fileName, size: fileSize, fileId, filePath: '', url: '', mimeType, date: new Date(msg.date * 1000).toISOString(), msgId: msg.message_id });
+      }
   }
   for (const grp of Object.values(chunkMap)) {
     const valid = grp.chunks.filter(Boolean);
@@ -1795,7 +1792,8 @@ function renderFiles() {
     }
   }
   area.innerHTML = html;
-
+  // Sau khi DOM xong: batch getFile cho tất cả ảnh đang hiển thị
+  requestAnimationFrame(loadImgUrls);
 }
 
 function renderGridCard(f) {
@@ -2718,25 +2716,78 @@ function fileIcon(ext) {
 
 
 
-// ── Image self-heal: onerror → getFile → fresh URL ──────────
-// Cách duy nhất đúng: img.src = cdnUrl trực tiếp (không fetch/CORS)
-// Khi URL expire → onerror → gọi getFile lấy URL mới → set lại src
+// ══════════════════════════════════════════════════════════
+// IMAGE URL ENGINE — Không bao giờ lưu CDN URL vào localStorage
+// Mỗi lần render: batch getFile → set img.src tươi
+// ══════════════════════════════════════════════════════════
+
+// Cache URL trong session (xoá khi reload) — tránh gọi getFile lặp
+const _urlSession = new Map(); // fileId → { url, ts }
+const URL_SESSION_TTL = 50 * 60 * 1000; // 50 phút
+
+function _sessionGetUrl(fileId) {
+  const e = _urlSession.get(fileId);
+  if (!e) return null;
+  if (Date.now() - e.ts > URL_SESSION_TTL) { _urlSession.delete(fileId); return null; }
+  return e.url;
+}
+function _sessionSetUrl(fileId, url) {
+  _urlSession.set(fileId, { url, ts: Date.now() });
+}
+
+// Gọi getFile và set src cho 1 img
+async function _loadOneImg(img) {
+  const fileId = img.dataset.fileid;
+  if (!fileId || !cfg || !cfg.token) return;
+
+  // Dùng cache session trước
+  let url = _sessionGetUrl(fileId);
+  if (!url) {
+    try {
+      const fi = await tgGet('getFile', { file_id: fileId });
+      if (!fi.ok || !fi.result?.file_path) return;
+      url = TG_API + '/file/bot' + cfg.token + '/' + fi.result.file_path;
+      _sessionSetUrl(fileId, url);
+    } catch { return; }
+  }
+  if (img.isConnected) img.src = url;
+}
+
+// Batch load tất cả img[data-fileid] trong viewport hiện tại
+// Dùng IntersectionObserver để chỉ load ảnh đang nhìn thấy
+let _imgObserver = null;
+function _ensureObserver() {
+  if (_imgObserver) return;
+  _imgObserver = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (!e.isIntersecting) return;
+      const img = e.target;
+      if (img.src && img.src !== location.href && !img.src.endsWith('/')) return; // đã có src
+      _imgObserver.unobserve(img);
+      _loadOneImg(img);
+    });
+  }, { rootMargin: '300px' });
+}
+
+function loadImgUrls() {
+  _ensureObserver();
+  document.querySelectorAll('img[data-fileid]').forEach(img => {
+    // Nếu chưa có src hoặc src rỗng → observe để load khi vào viewport
+    const s = img.src;
+    if (!s || s === location.href || s.endsWith('/')) {
+      _imgObserver.observe(img);
+    }
+  });
+}
+
+// onerror: URL hết hạn → xoá session cache → lấy URL mới
 async function refreshImgSrc(img) {
   const fileId = img.dataset.fileid;
-  if (!fileId || !cfg || !cfg.token) { img.style.opacity='0'; return; }
-  img.onerror = null; // tránh loop
-  try {
-    const fi = await tgGet('getFile', { file_id: fileId });
-    if (!fi.ok || !fi.result?.file_path) throw new Error('no path');
-    const newUrl = TG_API + '/file/bot' + cfg.token + '/' + fi.result.file_path;
-    img.src = newUrl;
-    // Cập nhật luôn vào fileStore để lần sau không cần refresh
-    const entry = fileStore.find(f => (f.id||f.fileId) === fileId);
-    if (entry) { entry.url = newUrl; entry.filePath = fi.result.file_path; }
-  } catch(e) {
-    img.style.opacity = '0';
-    console.warn('[img] refresh failed', fileId, e.message);
-  }
+  if (!fileId || !cfg || !cfg.token) { img.style.opacity = '0.2'; return; }
+  img.onerror = null;       // tránh loop
+  img.src     = '';         // reset
+  _urlSession.delete(fileId); // xoá cache cũ, buộc getFile mới
+  await _loadOneImg(img);
 }
 
 function thumbGradient(ext) {
