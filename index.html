@@ -2201,8 +2201,117 @@ function confirmSync() {
     <button class="modal-btn" onclick="exportCacheJson()" style="color:var(--text2)">💾 Export cache</button>
     <button class="modal-btn" onclick="closeModal('previewModal');manualPushCache()" style="color:var(--indigo);border-color:rgba(91,110,245,0.35)">📤 Push cache</button>
     <button class="modal-btn" onclick="closeModal('previewModal');fullSyncFromTelegram()" style="color:var(--red);border-color:rgba(220,38,38,0.28)">↺ Sync toàn bộ</button>
+    <button class="modal-btn" onclick="confirmClearAllCache()" style="color:var(--red);border-color:rgba(220,38,38,0.28)">🗑 Xoá cache</button>
     <button class="modal-btn primary" onclick="closeModal('previewModal');syncFromTelegram()">🔄 Sync file mới</button>`;
   openModal('previewModal');
+}
+
+
+// ── Xoá toàn bộ cache (confirm trước) ───────────────────────
+function confirmClearAllCache() {
+  let lsBytes = 0;
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      lsBytes += (k.length + (localStorage.getItem(k)||'').length) * 2;
+    }
+  } catch {}
+  const lsSize = lsBytes > 1048576
+    ? (lsBytes/1048576).toFixed(1) + ' MB'
+    : Math.round(lsBytes/1024) + ' KB';
+
+  closeModal('previewModal');
+
+  document.getElementById('previewTitle').textContent = '\ud83d\uddd1 Xo\u00e1 to\u00e0n b\u1ed9 cache';
+  document.getElementById('previewBody').innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:14px;padding:4px 0">
+      <div style="background:var(--red-bg);border:1.5px solid rgba(220,38,38,0.28);
+                  border-radius:14px;padding:14px 16px;font-size:13px;
+                  color:var(--text2);line-height:1.8">
+        \u26a0\ufe0f <b>H\u00e0nh \u0111\u1ed9ng n\u00e0y kh\u00f4ng th\u1ec3 ho\u00e0n t\u00e1c.</b><br>
+        T\u1ea5t c\u1ea3 d\u1eef li\u1ec7u cache c\u1ee5c b\u1ed9 s\u1ebd b\u1ecb xo\u00e1 ho\u00e0n to\u00e0n.
+      </div>
+      <div style="font-size:13px;color:var(--text2);line-height:2">
+        S\u1ebd xo\u00e1:
+        <ul style="margin:6px 0 0 18px;display:flex;flex-direction:column;gap:4px">
+          <li>\ud83d\udccb Danh s\u00e1ch file (localStorage) <b style="color:var(--text3)">${lsSize}</b></li>
+          <li>\ud83d\uddbc Blob \u1ea3nh \u0111\u00e3 cache (IndexedDB)</li>
+          <li>\ud83d\udd17 URL cache trong b\u1ed9 nh\u1edb</li>
+          <li>\u2764\ufe0f Danh s\u00e1ch y\u00eau th\u00edch &amp; file \u1ea9n</li>
+          <li>\ud83d\uddd1 Danh s\u00e1ch \u0111\u00e3 xo\u00e1</li>
+        </ul>
+      </div>
+      <div style="background:var(--indigo-light);border:1px solid rgba(91,110,245,0.2);
+                  border-radius:10px;padding:12px 14px;font-size:12px;
+                  color:var(--text2);line-height:1.7">
+        \ud83d\udca1 File v\u1eabn c\u00f2n nguy\u00ean tr\u00ean <b>Telegram</b>.<br>
+        Sau khi xo\u00e1, b\u1ea5m <b>Sync to\u00e0n b\u1ed9</b> \u0111\u1ec3 t\u1ea3i l\u1ea1i danh s\u00e1ch.
+      </div>
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer;
+                    font-size:13px;color:var(--text2);background:var(--surface2);
+                    border:1px solid var(--border);border-radius:10px;
+                    padding:12px 14px;user-select:none">
+        <input type="checkbox" id="clearCacheConfirmChk"
+          style="width:16px;height:16px;cursor:pointer;accent-color:var(--red)">
+        T\u00f4i hi\u1ec3u v\u00e0 mu\u1ed1n xo\u00e1 to\u00e0n b\u1ed9 cache
+      </label>
+    </div>`;
+
+  document.getElementById('previewFooter').innerHTML = `
+    <button class="modal-btn" onclick="closeModal('previewModal')">Hu\u1ef7</button>
+    <button class="modal-btn danger" id="doClearCacheBtn" disabled
+      style="background:var(--red);color:#fff;border-color:var(--red);opacity:0.45;transition:opacity 0.2s"
+      onclick="clearAllCache()">
+      \ud83d\uddd1 Xo\u00e1 to\u00e0n b\u1ed9
+    </button>`;
+
+  document.getElementById('clearCacheConfirmChk').addEventListener('change', function() {
+    const btn = document.getElementById('doClearCacheBtn');
+    btn.disabled = !this.checked;
+    btn.style.opacity = this.checked ? '1' : '0.45';
+  });
+
+  openModal('previewModal');
+}
+
+async function clearAllCache() {
+  closeModal('previewModal');
+  toast('\ud83d\uddd1 \u0110ang xo\u00e1 cache\u2026', '');
+  const errors = [];
+
+  // 1. localStorage — ch\u1ec9 xo\u00e1 keys c\u1ee7a app n\u00e0y
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('tdv2_')) keys.push(k);
+    }
+    keys.forEach(k => localStorage.removeItem(k));
+  } catch(e) { errors.push('localStorage: ' + e.message); }
+
+  // 2. IndexedDB blob cache
+  try {
+    await new Promise((res, rej) => {
+      const req = indexedDB.deleteDatabase('TeleDriveMedia');
+      req.onsuccess = () => res();
+      req.onerror   = () => rej(req.error);
+      req.onblocked = () => setTimeout(() => {
+        const r2 = indexedDB.deleteDatabase('TeleDriveMedia');
+        r2.onsuccess = res; r2.onerror = rej;
+      }, 600);
+    });
+  } catch(e) { errors.push('IndexedDB: ' + e.message); }
+
+  // 3. Reset state
+  fileStore = []; favorites = new Set(); hiddenIds = new Set();
+  cfg = {}; selected.clear();
+
+  if (errors.length) {
+    toast('\u26a0 Xo\u00e1 xong (l\u1ed7i nh\u1ecf): ' + errors.join(', '), 'warn');
+  } else {
+    toast('\u2705 \u0110\u00e3 xo\u00e1 to\u00e0n b\u1ed9 cache', 'success');
+  }
+  setTimeout(() => location.reload(), 1200);
 }
 
 let _pendingCachePayload = null;
